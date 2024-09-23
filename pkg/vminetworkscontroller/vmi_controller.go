@@ -2,6 +2,7 @@ package vminetworkscontroller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 
 	"k8s.io/utils/ptr"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -22,11 +24,13 @@ import (
 
 	ipamclaimsapi "github.com/k8snetworkplumbingwg/ipamclaims/pkg/crd/ipamclaims/v1alpha1"
 	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
+	v1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 
 	virtv1 "kubevirt.io/api/core/v1"
 
 	"github.com/kubevirt/ipam-extensions/pkg/claims"
 	"github.com/kubevirt/ipam-extensions/pkg/config"
+	"github.com/kubevirt/ipam-extensions/pkg/migration"
 	"github.com/kubevirt/ipam-extensions/pkg/udn"
 )
 
@@ -61,7 +65,6 @@ func (r *VirtualMachineInstanceReconciler) Reconcile(
 	} else if err != nil {
 		return controllerruntime.Result{}, err
 	}
-
 	vm, err := getOwningVM(ctx, r.Client, request.NamespacedName)
 	if err != nil {
 		return controllerruntime.Result{}, err
@@ -78,6 +81,11 @@ func (r *VirtualMachineInstanceReconciler) Reconcile(
 		return controllerruntime.Result{}, nil
 	}
 
+	if err := r.ensureL2MigrationArgs(ctx, vmi); err != nil {
+		r.Log.Error(err, "failed ensuring live migration args at virt-launcher pods")
+		return controllerruntime.Result{}, err
+	}
+
 	vmiNetworks, err := r.vmiNetworksClaimingIPAM(ctx, vmi)
 	if err != nil {
 		return controllerruntime.Result{}, err
@@ -85,6 +93,7 @@ func (r *VirtualMachineInstanceReconciler) Reconcile(
 
 	ownerInfo := ownerReferenceFor(vmi, vm)
 	for logicalNetworkName, netConfigName := range vmiNetworks {
+
 		claimKey := claims.ComposeKey(vmi.Name, logicalNetworkName)
 		ipamClaim := &ipamclaimsapi.IPAMClaim{
 			ObjectMeta: controllerruntime.ObjectMeta{
@@ -219,6 +228,43 @@ func (r *VirtualMachineInstanceReconciler) ensureVMINetworkWithUDN(network virtv
 
 	if nadConfig.AllowPersistentIPs {
 		vmiNets[network.Name] = nadConfig.Name
+	}
+	return nil
+}
+
+func (r *VirtualMachineInstanceReconciler) ensureL2MigrationArgs(ctx context.Context, vmi *virtv1.VirtualMachineInstance) error {
+	virtLauncherPods := &corev1.PodList{}
+	if err := r.Client.List(ctx, virtLauncherPods, client.InNamespace(vmi.Namespace), client.MatchingLabels{virtv1.VirtualMachineNameLabel: vmi.Name}); err != nil {
+		return err
+	}
+
+	for _, virtLauncherPod := range virtLauncherPods.Items {
+		if migration.PodCompleted(&virtLauncherPod) {
+			continue
+		}
+		networksString, ok := virtLauncherPod.Annotations[v1.NetworkAttachmentAnnot]
+		if !ok {
+			continue
+		}
+		networks := []*v1.NetworkSelectionElement{}
+		if err := json.Unmarshal([]byte(networksString), &networks); err != nil {
+			return err
+		}
+		for idx := range networks {
+			if err := migration.EnsureL2MigrationArgs(ctx, r.Client, networks[idx], &virtLauncherPod, vmi); err != nil {
+				return err
+			}
+		}
+		var err error
+		networksMarshaled, err := json.Marshal(networks)
+		if err != nil {
+			return err
+		}
+		virtLauncherPod.Annotations[v1.NetworkAttachmentAnnot] = string(networksMarshaled)
+		if err := r.Client.Update(ctx, &virtLauncherPod); err != nil {
+			return nil
+		}
+
 	}
 	return nil
 }

@@ -32,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
@@ -41,6 +42,7 @@ import (
 
 	"github.com/kubevirt/ipam-extensions/pkg/claims"
 	"github.com/kubevirt/ipam-extensions/pkg/config"
+	"github.com/kubevirt/ipam-extensions/pkg/migration"
 	"github.com/kubevirt/ipam-extensions/pkg/udn"
 )
 
@@ -220,13 +222,20 @@ func ensureIPAMClaimRefAtNetworkSelectionElements(ctx context.Context,
 			continue
 		}
 
+		klog.Infof("DELETEME, webook")
+		if err := migration.EnsureL2MigrationArgs(ctx, cli, networkSelectionElements[i], pod, vmi); err != nil {
+			return false, err
+		}
+
 		networkSelectionElements[i].IPAMClaimReference = claims.ComposeKey(vmName, networkName)
+
 		log.Info(
 			"requesting claim",
 			"NAD", nadName,
 			"network", pluginConfig.Name,
 			"claim", networkSelectionElement.IPAMClaimReference,
 		)
+
 		hasChangedNetworkSelectionElements = true
 		continue
 	}

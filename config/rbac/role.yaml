@@ -17,6 +17,7 @@ rules:
   resources:
   - "virtualmachines"
   - "virtualmachineinstances"
+  - "virtualmachineinstancemigrations"
   verbs: ["get", "list", "watch"]
 - apiGroups: ["kubevirt.io"]
   resources:

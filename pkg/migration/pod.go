@@ -14,52 +14,47 @@ import (
 )
 
 func EnsureL2MigrationArgs(ctx context.Context, cli client.Client, nse *v1.NetworkSelectionElement, virtLauncherPod *corev1.Pod, vmi *virtv1.VirtualMachineInstance) error {
+	if PodCompleted(virtLauncherPod) {
+		return nil
+	}
 	l2MigrationArgs, err := generateL2MigrationArgs(ctx, cli, virtLauncherPod, vmi)
 	if err != nil {
 		return err
 	}
-	klog.Infof("DELETEME, EnsureL2MigrationArgs, virtLauncherPod: %s, l2MigrationArgs: %+v", virtLauncherPod.Name, l2MigrationArgs)
 	if l2MigrationArgs != nil {
 		cniArgs := map[string]interface{}{
 			"ovn.k8s.org/l2-migration": l2MigrationArgs,
 		}
 		nse.CNIArgs = &cniArgs
+		klog.Infof("DELETEME, EnsureL2MigrationArgs, virtLauncherPod: %s, l2MigrationArgs: %+v", virtLauncherPod.Name, l2MigrationArgs)
 	}
 	return nil
 }
 
 func generateL2MigrationArgs(ctx context.Context, cli client.Client, virtLauncherPod *corev1.Pod, vmi *virtv1.VirtualMachineInstance) (*L2MigrationArgs, error) {
-	runningMigration, err := findRunningMigration(ctx, cli, vmi)
+	migration, err := findLastMigration(ctx, cli, vmi)
 	if err != nil {
 		return nil, err
 	}
-	if runningMigration == nil {
+	if migration == nil {
 		return nil, nil
 	}
-	podRole, err := generateL2MigrationPodRole(ctx, cli, virtLauncherPod, runningMigration)
+	podRole, err := generateL2MigrationPodRole(ctx, cli, virtLauncherPod, migration)
 	if err != nil {
 		return nil, err
 	}
 	return &L2MigrationArgs{
 		PortName: vmi.Name,
 		PodRole:  podRole,
-		State:    generateL2MigrationState(runningMigration.Status.MigrationState),
+		State:    generateL2MigrationState(migration.Status.MigrationState),
 	}, nil
 }
 
 func generateL2MigrationPodRole(ctx context.Context, cli client.Client, virtLauncherPod *corev1.Pod, migration *virtv1.VirtualMachineInstanceMigration) (string, error) {
-	// This is the creation of the virt launcher source pod since there is
-	// a migration involve
-	if virtLauncherPod.Name == "" {
-		return "Target", nil
-	}
-
-	if migration.Status.MigrationState.TargetPod == virtLauncherPod.Name {
-		return "Target", nil
-	} else if migration.Status.MigrationState.SourcePod == virtLauncherPod.Name {
+	if migration.Status.MigrationState.SourcePod == virtLauncherPod.Name {
 		return "Source", nil
 	}
-	return "Unknown", nil
+	return "Target", nil
 }
 
 func generateL2MigrationState(migrationState *virtv1.VirtualMachineInstanceMigrationState) string {
@@ -80,7 +75,7 @@ func sortVirtLauncherPods(ctx context.Context, cli client.Client, vmiNamespace, 
 	}
 	activeVirtLauncherPods := []*corev1.Pod{}
 	for _, virtLauncherPod := range virtLauncherPods.Items {
-		if podCompleted(&virtLauncherPod) {
+		if PodCompleted(&virtLauncherPod) {
 			continue
 		}
 		activeVirtLauncherPods = append(activeVirtLauncherPods, &virtLauncherPod)
@@ -92,6 +87,6 @@ func sortVirtLauncherPods(ctx context.Context, cli client.Client, vmiNamespace, 
 	return activeVirtLauncherPods, nil
 }
 
-func podCompleted(pod *corev1.Pod) bool {
+func PodCompleted(pod *corev1.Pod) bool {
 	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
 }
