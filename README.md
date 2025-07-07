@@ -1,4 +1,4 @@
-# kubevirt-ipam-claims
+# kubevirt-ipam-controller
 This repo provide a KubeVirt extension to create (and manage the lifecycle of)
 `IPAMClaim`s on behalf of KubeVirt virtual machines.
 
@@ -28,12 +28,13 @@ that implements this IPAM multi-network standard.
 - docker version 17.03+.
 - kubectl version v1.11.3+.
 - Access to a Kubernetes v1.11.3+ cluster.
+- [cert-manager](https://cert-manager.io) installed
 
 ### To Deploy on the cluster
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=<some-registry>/kubevirt-ipam-claims:<tag>
+make docker-build docker-push IMG=<some-registry>/ipam-controller:<tag>
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified. 
@@ -43,7 +44,7 @@ Make sure you have the proper permission to the registry if the above commands d
 **Deploy the Manager to the cluster with the image specified by `IMG`:**
 
 ```sh
-make deploy IMG=<some-registry>/kubevirt-ipam-claims:<tag>
+make deploy IMG=<some-registry>/ipam-controller:<tag>
 ```
 
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin 
@@ -62,7 +63,7 @@ Following are the steps to build the installer and distribute this project to us
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=<some-registry>/kubevirt-ipam-claims:<tag>
+make build-installer IMG=<some-registry>/ipam-controller:<tag>
 ```
 
 NOTE: The makefile target mentioned above generates an 'install.yaml'
@@ -75,8 +76,11 @@ its dependencies.
 Users can just run kubectl apply -f <URL for YAML BUNDLE> to install the project, i.e.:
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/maiqueb/kubevirt-ipam-claims/main/dist/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/kubevirt/ipam-extensions/main/dist/install.yaml
 ```
+
+> **NOTE**: The project require cert-manager to be installed in the cluster in order to operate.
+> Installing cert-manager instructions can be found at https://cert-manager.io/docs/installation/
 
 ## Requesting persistent IPs for KubeVirt VMs
 To opt-in to this feature, the network must allow persistent IPs; for that,
@@ -114,7 +118,7 @@ metadata:
     kubevirt.io/vm: vm-a
   name: vm-a
 spec:
-  running: true
+  runStrategy: Always
   template:
     metadata:
       name: vm-a

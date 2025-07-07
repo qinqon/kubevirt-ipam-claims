@@ -1,8 +1,9 @@
 
-# Image URL to use all building/pushing image targets
-IMG ?= kubevirt-ipam-controller:latest
+# Default to registry path for consistency with CI/CD
+IMG ?= ghcr.io/kubevirt/ipam-controller:$(shell ./hack/sanitize-branch.sh $(shell git rev-parse --abbrev-ref HEAD))
+export KUBECONFIG ?= $(shell pwd)/.output/kubeconfig
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
-ENVTEST_K8S_VERSION = 1.29.0
+ENVTEST_K8S_VERSION = 1.32.0
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -21,6 +22,8 @@ CONTAINER_TOOL ?= docker
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
 SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
+
+E2E_TEST_TIMEOUT ?= "1h"
 
 .PHONY: all
 all: build
@@ -60,14 +63,27 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
+.PHONY: vendor
+vendor:
+	go mod tidy
+	go mod vendor
+
+.PHONY: check-vendoring
+check-vendoring: vendor fmt vet
+	./hack/check-vendoring.sh
+
 .PHONY: test
 test: manifests generate fmt vet envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out -v -ginkgo.v
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out -v -ginkgo.v $(TEST_ARGS)
 
 # Utilize Kind or modify the e2e tests to load the image locally, enabling compatibility with other vendors.
 .PHONY: test-e2e  # Run the e2e tests against a Kind k8s instance that is spun up.
-test-e2e:
-	go test ./test/e2e/ -v -ginkgo.v
+test-e2e: ginkgo
+	export KUBECONFIG=${KUBECONFIG} && \
+	export PATH=$$(pwd)/.output/ovn-kubernetes/bin:$${PATH} && \
+	export REPORT_PATH=$$(pwd)/.output/ && \
+	cd test/e2e && \
+	$(GINKGO) -p -v --timeout=${E2E_TEST_TIMEOUT} --junit-report=$${REPORT_PATH}/test-e2e.junit.xml ${E2E_TEST_ARGS}
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter & yamllint
@@ -118,10 +134,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
-	@if [ -d "config/crd" ]; then \
-		$(KUSTOMIZE) build config/crd > dist/install.yaml; \
-	fi
-	echo "---" >> dist/install.yaml  # Add a document separator before appending
+	echo "---" > dist/install.yaml  # Add a document separator before appending
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default >> dist/install.yaml
 
@@ -148,17 +161,19 @@ $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
 ## Tool Binaries
-KUBECTL ?= kubectl
+export KUBECTL ?= kubectl
 KUSTOMIZE ?= $(LOCALBIN)/kustomize-$(KUSTOMIZE_VERSION)
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_TOOLS_VERSION)
 ENVTEST ?= $(LOCALBIN)/setup-envtest-$(ENVTEST_VERSION)
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+GINKGO = $(LOCALBIN)/ginkgo-$(GINKGO_VERSION)
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.3.0
 CONTROLLER_TOOLS_VERSION ?= v0.14.0
 ENVTEST_VERSION ?= latest
-GOLANGCI_LINT_VERSION ?= v1.54.2
+GOLANGCI_LINT_VERSION ?= v1.63.4
+GINKGO_VERSION ?= v2.22.0
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -179,6 +194,22 @@ $(ENVTEST): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/cmd/golangci-lint,${GOLANGCI_LINT_VERSION})
+
+.PHONY: ginkgo
+ginkgo:
+	$(call go-install-tool,$(GINKGO),github.com/onsi/ginkgo/v2/ginkgo,${GINKGO_VERSION})
+
+.PHONY: cluster-up
+cluster-up:
+	./hack/cluster.sh up
+
+.PHONY: cluster-down
+cluster-down:
+	./hack/cluster.sh down
+
+.PHONY: cluster-sync
+cluster-sync:
+	./hack/cluster.sh sync
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary (ideally with version)

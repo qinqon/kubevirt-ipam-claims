@@ -26,6 +26,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -44,8 +45,9 @@ import (
 	ipamclaimsapi "github.com/k8snetworkplumbingwg/ipamclaims/pkg/crd/ipamclaims/v1alpha1"
 	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 
-	"github.com/maiqueb/kubevirt-ipam-claims/pkg/ipamclaimswebhook"
-	"github.com/maiqueb/kubevirt-ipam-claims/pkg/vmnetworkscontroller"
+	"github.com/kubevirt/ipam-extensions/pkg/ipamclaimswebhook"
+	"github.com/kubevirt/ipam-extensions/pkg/vminetworkscontroller"
+	"github.com/kubevirt/ipam-extensions/pkg/vmnetworkscontroller"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -66,6 +68,7 @@ func main() {
 	var enableLeaderElection bool
 	var probeAddr string
 	var enableHTTP2 bool
+	var certDir string
 
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -73,6 +76,13 @@ func main() {
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(
+		&certDir,
+		"certificates-dir",
+		"",
+		"Specify the certificates directory for the webhook server",
+	)
+
 	opts := zap.Options{
 		Development: true,
 	}
@@ -97,9 +107,14 @@ func main() {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
 
-	webhookServer := webhook.NewServer(webhook.Options{
+	webhookOptions := webhook.Options{
 		TLSOpts: tlsOpts,
-	})
+	}
+	if certDir != "" {
+		setupLog.Info("using certificates directory", "dir", certDir)
+		webhookOptions.CertDir = certDir
+	}
+	webhookServer := webhook.NewServer(webhookOptions)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
@@ -121,7 +136,8 @@ func main() {
 		NewCache: func(config *rest.Config, opts cache.Options) (cache.Cache, error) {
 			opts.ByObject = map[client.Object]cache.ByObject{
 				&corev1.Pod{}: {
-					Label: virtLauncherSelector(),
+					Label:     virtLauncherSelector(),
+					Transform: pruneIrrelevantPodData,
 				},
 			}
 			return cache.New(config, opts)
@@ -148,6 +164,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err = vminetworkscontroller.NewVMIReconciler(mgr).Setup(); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "VirtualMachineInstance")
+		os.Exit(1)
+	}
+
 	if err := ctrl.NewWebhookManagedBy(mgr).For(&corev1.Pod{}).Complete(); err != nil {
 		setupLog.Error(err, "unable to create webhook controller", "controller", "Pod")
 	}
@@ -166,4 +187,24 @@ func main() {
 
 func virtLauncherSelector() labels.Selector {
 	return labels.SelectorFromSet(map[string]string{virtv1.AppLabel: "virt-launcher"})
+}
+
+func pruneIrrelevantPodData(obj interface{}) (interface{}, error) {
+	oldPod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return obj, nil
+	}
+
+	newPod := oldPod.DeepCopy()
+	newPod.ObjectMeta = metav1.ObjectMeta{
+		Name:        oldPod.Name,
+		Namespace:   oldPod.Namespace,
+		UID:         oldPod.UID,
+		Annotations: oldPod.Annotations,
+		Labels:      oldPod.Labels,
+	}
+	newPod.Spec = corev1.PodSpec{}
+	newPod.Status = corev1.PodStatus{}
+
+	return newPod, nil
 }

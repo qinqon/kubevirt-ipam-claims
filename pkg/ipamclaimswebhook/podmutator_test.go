@@ -9,6 +9,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/types"
 
 	"gomodules.xyz/jsonpatch/v2"
 
@@ -36,9 +37,10 @@ import (
 type testConfig struct {
 	inputVM                   *virtv1.VirtualMachine
 	inputVMI                  *virtv1.VirtualMachineInstance
-	inputNAD                  *nadv1.NetworkAttachmentDefinition
+	inputNADs                 []*nadv1.NetworkAttachmentDefinition
 	inputPod                  *corev1.Pod
-	expectedAdmissionResponse admission.Response
+	expectedAdmissionResponse admissionv1.AdmissionResponse
+	expectedAdmissionPatches  types.GomegaMatcher
 }
 
 func TestController(t *testing.T) {
@@ -86,8 +88,8 @@ var _ = Describe("KubeVirt IPAM launcher pod mutato machine", Serial, func() {
 			initialObjects = append(initialObjects, config.inputVMI)
 		}
 
-		if config.inputNAD != nil {
-			initialObjects = append(initialObjects, config.inputNAD)
+		for _, nad := range config.inputNADs {
+			initialObjects = append(initialObjects, nad)
 		}
 
 		ctrlOptions := controllerruntime.Options{
@@ -105,86 +107,135 @@ var _ = Describe("KubeVirt IPAM launcher pod mutato machine", Serial, func() {
 
 		ipamClaimsManager := NewIPAMClaimsValet(mgr)
 
-		Expect(
-			ipamClaimsManager.Handle(context.Background(), podAdmissionRequest(config.inputPod)),
-		).To(
-			Equal(config.expectedAdmissionResponse),
-		)
+		result := ipamClaimsManager.Handle(context.Background(), podAdmissionRequest(config.inputPod))
+
+		Expect(result.AdmissionResponse).To(Equal(config.expectedAdmissionResponse))
+		if config.expectedAdmissionPatches != nil {
+			Expect(result.Patches).To(config.expectedAdmissionPatches)
+		}
 	},
-		Entry("pod not requesting secondary attachments is accepted", testConfig{
+		Entry("pod not beloging to a VM and not requesting secondary "+
+			"attachments and no primary user defined network is accepted", testConfig{
 			inputVM:  dummyVM(nadName),
 			inputVMI: dummyVMI(nadName),
-			inputNAD: dummyNAD(nadName),
+			inputNADs: []*nadv1.NetworkAttachmentDefinition{
+				dummyNAD(nadName),
+			},
 			inputPod: &corev1.Pod{},
-			expectedAdmissionResponse: admission.Response{
-				AdmissionResponse: admissionv1.AdmissionResponse{
-					Allowed: true,
-					Result: &metav1.Status{
-						Message: "no secondary networks requested",
-						Code:    http.StatusOK,
-					},
+			expectedAdmissionResponse: admissionv1.AdmissionResponse{
+				Allowed: true,
+				Result: &metav1.Status{
+					Message: "not a VM",
+					Code:    http.StatusOK,
 				},
 			},
 		}),
-		Entry("vm launcher pod with an attachment to a network with persistent IPs enabled requests an IPAMClaim", testConfig{
+		Entry("vm launcher pod with an attachment to a primary and secondary user "+
+			"defined network with persistent IPs enabled requests an IPAMClaim", testConfig{
 			inputVM:  dummyVM(nadName),
 			inputVMI: dummyVMI(nadName),
-			inputNAD: dummyNAD(nadName),
-			inputPod: dummyPodForVM(nadName, vmName),
-			expectedAdmissionResponse: admission.Response{
-				AdmissionResponse: admissionv1.AdmissionResponse{
-					Allowed:   true,
-					PatchType: &patchType,
-				},
-				Patches: []jsonpatch.JsonPatchOperation{
-					{
-						Operation: "replace",
-						Path:      "/metadata/annotations/k8s.v1.cni.cncf.io~1networks",
-						Value:     "[{\"name\":\"supadupanet\",\"namespace\":\"ns1\",\"ipam-claim-reference\":\"vm1.randomnet\"}]",
-					},
-				},
+			inputNADs: []*nadv1.NetworkAttachmentDefinition{
+				dummyNAD(nadName),
+				dummyPrimaryNetworkNAD(nadName),
 			},
+			inputPod: dummyPodForVM(nadName, vmName),
+			expectedAdmissionResponse: admissionv1.AdmissionResponse{
+				Allowed:   true,
+				PatchType: &patchType,
+			},
+			expectedAdmissionPatches: ConsistOf([]jsonpatch.JsonPatchOperation{
+				{
+					Operation: "add",
+					Path:      "/metadata/annotations/k8s.ovn.org~1primary-udn-ipamclaim",
+					Value:     "vm1.podnet",
+				},
+				{
+					Operation: "replace",
+					Path:      "/metadata/annotations/k8s.v1.cni.cncf.io~1networks",
+					Value:     "[{\"name\":\"supadupanet\",\"namespace\":\"ns1\",\"ipam-claim-reference\":\"vm1.randomnet\"}]",
+				},
+			}),
+		}),
+		Entry("vm launcher pod with with primary user defined network defined "+
+			"at namespace with persistent IPs enabled requests an IPAMClaim", testConfig{
+			inputVM:  dummyVM(nadName),
+			inputVMI: dummyVMI(nadName),
+			inputNADs: []*nadv1.NetworkAttachmentDefinition{
+				dummyPrimaryNetworkNAD(nadName),
+			},
+			inputPod: dummyPodForVM("" /*without network selection element*/, vmName),
+			expectedAdmissionResponse: admissionv1.AdmissionResponse{
+				Allowed:   true,
+				PatchType: &patchType,
+			},
+			expectedAdmissionPatches: Equal([]jsonpatch.JsonPatchOperation{
+				{
+					Operation: "add",
+					Path:      "/metadata/annotations/k8s.ovn.org~1primary-udn-ipamclaim",
+					Value:     "vm1.podnet",
+				},
+			}),
+		}),
+		Entry("vm launcher pod with an attachment to a secondary user defined "+
+			"network with persistent IPs enabled requests an IPAMClaim", testConfig{
+			inputVM:  dummyVM(nadName),
+			inputVMI: dummyVMI(nadName),
+			inputNADs: []*nadv1.NetworkAttachmentDefinition{
+				dummyNAD(nadName),
+			},
+			inputPod: dummyPodForVM(nadName, vmName),
+			expectedAdmissionResponse: admissionv1.AdmissionResponse{
+				Allowed:   true,
+				PatchType: &patchType,
+			},
+			expectedAdmissionPatches: Equal([]jsonpatch.JsonPatchOperation{
+				{
+					Operation: "replace",
+					Path:      "/metadata/annotations/k8s.v1.cni.cncf.io~1networks",
+					Value:     "[{\"name\":\"supadupanet\",\"namespace\":\"ns1\",\"ipam-claim-reference\":\"vm1.randomnet\"}]",
+				},
+			}),
 		}),
 		Entry("vm launcher pod with an attachment to a network *without* persistentIPs is accepted", testConfig{
 			inputVM:  dummyVM(nadName),
 			inputVMI: dummyVMI(nadName),
-			inputNAD: dummyNADWithoutPersistentIPs(nadName),
+			inputNADs: []*nadv1.NetworkAttachmentDefinition{
+				dummyNADWithoutPersistentIPs(nadName),
+			},
 			inputPod: dummyPodForVM(nadName, vmName),
-			expectedAdmissionResponse: admission.Response{
-				AdmissionResponse: admissionv1.AdmissionResponse{
-					Allowed: true,
-					Result: &metav1.Status{
-						Message: "mutation not needed",
-						Code:    http.StatusOK,
-					},
+			expectedAdmissionResponse: admissionv1.AdmissionResponse{
+				Allowed: true,
+				Result: &metav1.Status{
+					Message: "carry on",
+					Code:    http.StatusOK,
 				},
 			},
 		}),
 		Entry("pod not belonging to a VM with an attachment to a network with persistent IPs enabled is accepted", testConfig{
-			inputNAD: dummyNAD(nadName),
+			inputNADs: []*nadv1.NetworkAttachmentDefinition{
+				dummyNAD(nadName),
+			},
 			inputPod: dummyPod(nadName),
-			expectedAdmissionResponse: admission.Response{
-				AdmissionResponse: admissionv1.AdmissionResponse{
-					Allowed: true,
-					Result: &metav1.Status{
-						Message: "not a VM",
-						Code:    http.StatusOK,
-					},
+			expectedAdmissionResponse: admissionv1.AdmissionResponse{
+				Allowed: true,
+				Result: &metav1.Status{
+					Message: "not a VM",
+					Code:    http.StatusOK,
 				},
 			},
 		}),
 		Entry("pod requesting an attachment via a NAD with an invalid configuration throws a BAD REQUEST", testConfig{
 			inputVM:  dummyVM(nadName),
 			inputVMI: dummyVMI(nadName),
-			inputNAD: dummyNAD(nadName),
-			inputPod: pod("{not json}", nil),
-			expectedAdmissionResponse: admission.Response{
-				AdmissionResponse: admissionv1.AdmissionResponse{
-					Allowed: false,
-					Result: &metav1.Status{
-						Message: "failed to parse pod network selection elements",
-						Code:    http.StatusBadRequest,
-					},
+			inputNADs: []*nadv1.NetworkAttachmentDefinition{
+				dummyNAD(nadName),
+			},
+			inputPod: dummyPodForVM("{not json}", vmName),
+			expectedAdmissionResponse: admissionv1.AdmissionResponse{
+				Allowed: false,
+				Result: &metav1.Status{
+					Message: "failed to parse pod network selection elements",
+					Code:    http.StatusBadRequest,
 				},
 			},
 		}),
@@ -192,26 +243,24 @@ var _ = Describe("KubeVirt IPAM launcher pod mutato machine", Serial, func() {
 			inputVM:  dummyVM(nadName),
 			inputVMI: dummyVMI(nadName),
 			inputPod: dummyPodForVM(nadName, vmName),
-			expectedAdmissionResponse: admission.Response{
-				AdmissionResponse: admissionv1.AdmissionResponse{
-					Allowed: true,
-					Result: &metav1.Status{
-						Message: "NAD not found, will hang on scheduler",
-						Code:    http.StatusOK,
-					},
+			expectedAdmissionResponse: admissionv1.AdmissionResponse{
+				Allowed: true,
+				Result: &metav1.Status{
+					Message: "carry on",
+					Code:    http.StatusOK,
 				},
 			},
 		}),
 		Entry("launcher pod whose VMI is not found throws a server error", testConfig{
-			inputNAD: dummyNAD(nadName),
+			inputNADs: []*nadv1.NetworkAttachmentDefinition{
+				dummyNAD(nadName),
+			},
 			inputPod: dummyPodForVM(nadName, vmName),
-			expectedAdmissionResponse: admission.Response{
-				AdmissionResponse: admissionv1.AdmissionResponse{
-					Allowed: false,
-					Result: &metav1.Status{
-						Message: "virtualmachineinstances.kubevirt.io \"vm1\" not found",
-						Code:    http.StatusInternalServerError,
-					},
+			expectedAdmissionResponse: admissionv1.AdmissionResponse{
+				Allowed: false,
+				Result: &metav1.Status{
+					Message: "virtualmachineinstances.kubevirt.io \"vm1\" not found",
+					Code:    http.StatusInternalServerError,
 				},
 			},
 		}),
@@ -261,7 +310,7 @@ func dummyVMISpec(nadName string) virtv1.VirtualMachineInstanceSpec {
 	}
 }
 
-func dummyNAD(nadName string) *nadv1.NetworkAttachmentDefinition {
+func dummyNADWithConfig(nadName string, config string) *nadv1.NetworkAttachmentDefinition {
 	namespaceAndName := strings.Split(nadName, "/")
 	return &nadv1.NetworkAttachmentDefinition{
 		ObjectMeta: metav1.ObjectMeta{
@@ -269,22 +318,20 @@ func dummyNAD(nadName string) *nadv1.NetworkAttachmentDefinition {
 			Name:      namespaceAndName[1],
 		},
 		Spec: nadv1.NetworkAttachmentDefinitionSpec{
-			Config: `{"name": "goodnet", "allowPersistentIPs": true}`,
+			Config: config,
 		},
 	}
 }
 
+func dummyNAD(nadName string) *nadv1.NetworkAttachmentDefinition {
+	return dummyNADWithConfig(nadName, `{"name": "goodnet", "allowPersistentIPs": true}`)
+}
+
+func dummyPrimaryNetworkNAD(nadName string) *nadv1.NetworkAttachmentDefinition {
+	return dummyNADWithConfig(nadName+"primary", `{"name": "primarynet", "role": "primary", "allowPersistentIPs": true}`)
+}
 func dummyNADWithoutPersistentIPs(nadName string) *nadv1.NetworkAttachmentDefinition {
-	namespaceAndName := strings.Split(nadName, "/")
-	return &nadv1.NetworkAttachmentDefinition{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespaceAndName[0],
-			Name:      namespaceAndName[1],
-		},
-		Spec: nadv1.NetworkAttachmentDefinitionSpec{
-			Config: `{"name": "goodnet"}`,
-		},
-	}
+	return dummyNADWithConfig(nadName, `{"name": "goodnet"}`)
 }
 
 func podAdmissionRequest(pod *corev1.Pod) admission.Request {
@@ -312,8 +359,9 @@ func dummyPod(nadName string) *corev1.Pod {
 }
 
 func pod(nadName string, annotations map[string]string) *corev1.Pod {
-	baseAnnotations := map[string]string{
-		nadv1.NetworkAttachmentAnnot: nadName,
+	baseAnnotations := map[string]string{}
+	if nadName != "" {
+		baseAnnotations[nadv1.NetworkAttachmentAnnot] = nadName
 	}
 	for k, v := range annotations {
 		baseAnnotations[k] = v

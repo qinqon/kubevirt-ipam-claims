@@ -1,0 +1,98 @@
+name: Checks
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-linters-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v3
+      with:
+        go-version-file: 'go.mod'
+
+    - name: Check vendoring
+      run: make check-vendoring
+
+    - name: Build
+      run: time make
+
+    - name: Linters
+      uses: golangci/golangci-lint-action@v7
+      with:
+        version: v2.0.2
+        args: --timeout 3m --verbose cmd/... pkg/...
+
+    - name: Sanitize branch name for container image tag
+      shell: bash
+      run: |
+        BRANCH_NAME="${{ github.ref_name }}"
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          BRANCH_NAME="${{ github.base_ref }}"
+        fi
+        SANITIZED_BRANCH=$(./hack/sanitize-branch.sh "${BRANCH_NAME}")
+        echo "image_tag=${SANITIZED_BRANCH}" >> $GITHUB_ENV
+
+    - name: Ensure branch contains manifests with correct image tag
+      run: |
+        echo "" > dist/install.yaml
+        IMG=ghcr.io/kubevirt/ipam-controller:${{ env.image_tag }} make build-installer
+        if [[ -n "$(git status --porcelain)" ]]; then
+          echo "Please run 'make build-installer' and commit those changes"
+          git status --porcelain
+          exit 1
+        fi
+
+    - name: Test
+      run: ENVTEST_VERSION="release-0.20" make test
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v3
+      with:
+        go-version-file: 'go.mod'
+
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/local/lib/android/sdk
+        sudo apt-get update
+        sudo eatmydata apt-get purge --auto-remove -y \
+          azure-cli aspnetcore-* dotnet-* ghc-* firefox \
+          google-chrome-stable \
+          llvm-* microsoft-edge-stable mono-* \
+          mysql-server-core-* php-* php7* \
+          powershell temurin-* zulu-*
+
+    - name: Start cluster
+      env:
+        KIND_ALLOW_SYSTEM_WRITES: true
+      run: make cluster-up
+
+    - name: Sync cluster
+      run: make cluster-sync
+
+    - name: Run e2e tests
+      run: make test-e2e
+
+    - uses: actions/upload-artifact@v4  # upload test results
+      if: success() || failure()        # run this step even if previous step failed
+      with:
+        name: test-e2e-results
+        path: .output/*.xml
+
+    - name: Upload logs as artifacts
+      uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: test-logs
+        path: ./test/e2e/_output/*.log
